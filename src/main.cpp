@@ -141,8 +141,10 @@ void controlLoop() {
     if(!isnan(h) && (h >= cfg.rh_on_pct)) wantOn = true;
 
     if(!isnan(t_main) && (t_main <= cfg.temp_off_c) && !isnan(h) && (h <= cfg.rh_off_pct)) wantOn = false;
+  
   } else if (fanMode == FanMode::FORCE_ON) {
     wantOn = true;
+  
   } else {
     wantOn = false;
   }
@@ -155,23 +157,78 @@ void controlLoop() {
 
 // TELEMETRY PRINTING
 
-void printTelemetry() {
-  double lat = gps.location.isValid() ? gps.location.lat() : NAN;
-  double lon = gps.location.isValid() ? gps.location.lng() : NAN;
-  int sat = gps.satellites.isValid() ? gps.satellites.value() : -1;
-
-  Serial.printf("{ \"t_ds\":%.2f, \"t_dht\":%.2f, \"rh\":%.1f, \"t_main\":%.2f, "
-    "\"fan\":\"%s\", \"mode\":\"%s\", \"lamp\":\"%s\", "
-    "\"lat\":%s, \"lon\":%s, \"sat\":%d }\n",
-    t_ds_c, t_dht_c, rh_dht, t_main,
-    fanState?"ON":"OFF",
-    fanMode==FanMode::AUTO?"AUTO":(fanMode==FanMode::FORCE_ON?"FORCE_ON":"FORCE_OFF"),
-    lampState?"ON":"OFF",
-    isnan(lat)?"null":String(lat,6).c_str(),
-    isnan(lon)?"null":String(lon,6).c_str(),
-    sat
-  );
+// ---------- Pretty printer helpers ----------
+const char* modeName(FanMode m) {
+  switch (m) {
+    case FanMode::AUTO:      return "AUTO";
+    case FanMode::FORCE_ON:  return "FORCE_ON";
+    case FanMode::FORCE_OFF: return "FORCE_OFF";
+  }
+  return "?";
 }
+
+void printDivider() {
+  Serial.println(F("----------------------------------------"));
+}
+
+void printLineF(const char* label, float v, const char* unit = nullptr, uint8_t dp = 2) {
+  Serial.print(label); Serial.print(F(": "));
+  if (isnan(v)) {
+    Serial.println(F("N/A"));
+  } else {
+    Serial.print(v, dp);
+    if (unit) { Serial.print(' '); Serial.print(unit); }
+    Serial.println();
+  }
+}
+
+void printLineS(const char* label, const char* v) {
+  Serial.print(label); Serial.print(F(": "));
+  Serial.println(v ? v : "-");
+}
+
+void printLineI(const char* label, int v) {
+  Serial.print(label); Serial.print(F(": "));
+  Serial.println(v);
+}
+
+
+void printTelemetry() {
+  // Baca GPS jika ada
+  bool gpsFix = gps.location.isValid();
+  double lat = gpsFix ? gps.location.lat() : NAN;
+  double lon = gpsFix ? gps.location.lng() : NAN;
+  bool satValid = gps.satellites.isValid();
+  int   sat = satValid ? gps.satellites.value() : -1;
+
+  printDivider();
+  Serial.println(F("INKUBATOR TELEMETRY"));
+  printDivider();
+
+  // Suhu & kelembapan
+  printLineF("temp_ds",   t_ds_c,  "°C");
+  printLineF("temp_dht",  t_dht_c, "°C");
+  printLineF("roomHumid_dht", rh_dht, "%");
+  printLineF("temp_main", t_main, "°C");
+
+  // Status aktuator
+  printLineS("fan",  fanState ? "ON" : "OFF");
+  printLineS("mode", modeName(fanMode));
+  printLineS("lamp", lampState ? "ON" : "OFF");
+
+  // GPS
+  if (gpsFix) {
+    Serial.print(F("gps_lat: ")); Serial.println(lat, 6);
+    Serial.print(F("gps_lon: ")); Serial.println(lon, 6);
+  } else {
+    Serial.println(F("gps_lat: N/A"));
+    Serial.println(F("gps_lon: N/A"));
+  }
+  printLineI("gps_sat", satValid ? sat : -1);
+
+  printDivider();
+}
+
 
 // ================== SERIAL MENU =================
 void printHelp() {
