@@ -7,6 +7,8 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
+#include <LiquidCrystal_I2C.h>
+
 
 // WIFI
 const char* WIFI_SSID = "POCO X3 NFC";
@@ -36,14 +38,23 @@ const char* mqtt_password = "DxESP32Rext";
 char clientId[40] = {0}; 
 
 // MQTT Topics
-const char* TOPIC_STATE = "/psk/incubator/state";
-const char* TOPIC_TELEMETRY = "/psk/incubator/telemetry";
-const char* TOPIC_FAN = "/psk/incubator/fan";
-const char* TOPIC_LAMP = "/psk/incubator/lamp";
-const char* TOPIC_CONTROL_MODE = "/psk/incubator/control-mode";
-const char* TOPIC_STATUS = "/psk/incubator/status";
+const char* DEVICE_CODE = "001";
 
-const size_t MQTT_BUFFER = 512;
+// --- Buffer topic dinamis ---
+char TP_STATE[64], TP_TELEM[64], TP_FAN[64], TP_LAMP[64], TP_MODE[64], TP_PARAMS[64], TP_STATUS[64];
+
+void buildTopics() {
+  snprintf(TP_STATE,  sizeof(TP_STATE),  "/psk/incubator/%s/state",        DEVICE_CODE);
+  snprintf(TP_TELEM,  sizeof(TP_TELEM),  "/psk/incubator/%s/telemetry",    DEVICE_CODE);
+  snprintf(TP_FAN,    sizeof(TP_FAN),    "/psk/incubator/%s/fan",          DEVICE_CODE);
+  snprintf(TP_LAMP,   sizeof(TP_LAMP),   "/psk/incubator/%s/lamp",         DEVICE_CODE);
+  snprintf(TP_MODE,   sizeof(TP_MODE),   "/psk/incubator/%s/control-mode", DEVICE_CODE);
+  snprintf(TP_PARAMS, sizeof(TP_PARAMS), "/psk/incubator/%s/sensor-param", DEVICE_CODE);
+  snprintf(TP_STATUS, sizeof(TP_STATUS), "/psk/incubator/%s/status",       DEVICE_CODE);
+}
+
+
+const size_t MQTT_BUFFER = 1024;
 uint32_t stateRev = 0;
 
 bool needPublishState = true;
@@ -98,8 +109,11 @@ uint8_t fanArr[6] = {0,0,0,0,0,0};
 const uint8_t LAMP_CH[] = { 6, 7 };
 
 // DHT22
-#define DHT_PIN 17
+#define DHT_PIN 23
 #define DHT_TYPE DHT22
+
+// LCD - I2C
+#define LCD_I2C_ADDR 0x27
 
 // DS18B20
 #define ONEWIRE_PIN 4
@@ -108,12 +122,49 @@ const uint8_t LAMP_CH[] = { 6, 7 };
 #define GPS_RX_PIN 13
 #define GPS_TX_PIN 5
 
+// LIQUID CRYSTAL I2C
+#define LCD_ADDR 0x27
+#define LCD_COLS 20
+#define LCD_ROWS 4
+
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+
+// scheduler LCD display
+uint32_t tNextLcd = 0;
+const uint32_t LCD_PERIOD_MS = 1000;
+
+// chaching flicker
+// cache untuk anti-flicker sampai 4 baris
+char lcdCache[4][21] = {0};
+
+void lcdPrintPadded(uint8_t row, const char* s) {
+  if (row >= LCD_ROWS) return;
+  char buf[21];
+  size_t i = 0;
+  // copy sampai LCD_COLS
+  while (s[i] && i < LCD_COLS) { buf[i] = s[i]; i++; }
+  // pad spasi
+  while (i < LCD_COLS) buf[i++] = ' ';
+  buf[i] = '\0';
+
+  if (strncmp(lcdCache[row], buf, LCD_COLS) != 0) {
+    lcd.setCursor(0, row);
+    lcd.print(buf);
+    strncpy(lcdCache[row], buf, LCD_COLS + 1);
+  }
+}
+
 struct Controlfg {
-  float temp_on_c = 36.0f;
-  float temp_off_c = 35.5f;
-  float rh_on_pct = 65.0f;
-  float rh_off_pct = 60.0f;
-  float ema_alpha = 0.20f;
+  float    temp_on_c  = 30.0f;
+  float    temp_off_c = 29.5f;
+  float    rh_on_pct  = 60.0f;
+  float    rh_off_pct = 60.0f;
+  float    ema_alpha  = 0.20f;
+
+  // anti-chatter (opsional, default aktif)
+  uint32_t min_on_ms  = 5000;   // minimum ON 5s
+  uint32_t min_off_ms = 5000;   // minimum OFF 5s
+  bool     anti_chatter = true;
 } cfg;
 
 
@@ -160,7 +211,7 @@ float t_dht_c = NAN;
 float rh_dht = NAN;
 float t_main = NAN;
 
-// EMA BUFFER
+// EMA BUFFER (Exponential Moving Average)
 
 float ema(float prev, float val, float alpha) {
   if (isnan(val)) return prev;
@@ -169,11 +220,18 @@ float ema(float prev, float val, float alpha) {
   return (alpha * val) + (1.0f - alpha) *prev;
 }
 
-enum class FanMode: uint8_t { AUTO = 0, MANUAL, FORCE_ON, FORCE_OFF };
+enum class FanMode: uint8_t { AUTO = 0, MANUAL };
 FanMode fanMode = FanMode::AUTO;
 bool fanState = false;
 
-// LAMP STATE (combined with CH7 & CH8)
+bool fans_group_on = false;        // snapshot ON/OFF grup kipas
+uint32_t lastSwitchAt = 0;         // timestamp perubahan terakhir
+
+
+inline bool anyFansOn() {
+  return fanArr[0] || fanArr[1] || fanArr[2] || fanArr[3] || fanArr[4] || fanArr[5];
+}
+
 
 bool lampState = false;
 
@@ -202,24 +260,33 @@ const uint32_t CTRL_PERIOD_MS = 500;
 
 // FAN CONTROL
 void applyFanGroup(bool on) {
-  for(size_t i = 0; i < sizeof(FAN_CH); i++) {
+  const bool cur = anyFansOn();
+  if (cur == on) return;                // tidak perlu nulis relay lagi
+
+  for (size_t i = 0; i < sizeof(FAN_CH); i++) {
     uint8_t pin = RELAY_PINS[FAN_CH[i]];
-    if(on) relayOnPin(pin); else relayOffPin(pin);
+    if (on) relayOnPin(pin); else relayOffPin(pin);
     fanArr[i] = on ? 1 : 0;
   }
+  fans_group_on = on;
+  lastSwitchAt  = millis();
+
   needPublishState = true;
   stateRev++;
 }
 
 void applyFanArray(const uint8_t arr[6]) {
-  for(size_t i = 0; i < 6; ++i) {
+  for (size_t i = 0; i < 6; ++i) {
     uint8_t pin = RELAY_PINS[FAN_CH[i]];
-    if(arr[i]) relayOnPin(pin); else relayOffPin(pin);
-
+    if (arr[i]) relayOnPin(pin); else relayOffPin(pin);
     fanArr[i] = arr[i] ? 1 : 0;
-    stateRev++;
   }
+  fans_group_on = anyFansOn();
+  lastSwitchAt  = millis();
+  stateRev++;
+  needPublishState = true;
 }
+
 
 void applyLamp(bool on) {
   setGroup(LAMP_CH, sizeof(LAMP_CH), on);
@@ -243,84 +310,92 @@ void buildLampArrayJson(char out[8]) {
 // MQTT Callback
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String t = topic;
-  DynamicJsonDocument doc(384);
+  DynamicJsonDocument doc(768);
 
   DeserializationError err = deserializeJson(doc, payload, length);
-  if(err) {
+  if (err) {
     Serial.printf("[MQTT] JSON parse error: %s (topic=%s)\n", err.c_str(), topic);
     return;
   }
-  
-  Serial.println("MSG NIHH: \n");
-  serializeJson(doc, Serial);
-  Serial.println();
-  
-  auto parseMode = [&]() -> bool {
-    if(!doc.containsKey("mode")) return false;
-    
-    const char* m = doc["mode"];
 
-    if(!m) return false;
-    if(!strcasecmp(m, "AUTO")) fanMode = FanMode::AUTO;
-    else if(!strcasecmp(m, "MANUAL")) fanMode = FanMode::MANUAL;
-    else if(!strcasecmp(m, "FORCE_ON")) fanMode = FanMode::FORCE_ON;
-    else if(!strcasecmp(m, "FORCE_OFF")) fanMode = FanMode::FORCE_OFF;
-    
+  auto parseMode = [&]() -> bool {
+    if (!doc.containsKey("mode")) return false;
+    const char* m = doc["mode"];
+    if (!m) return false;
+
+    if (!strcasecmp(m, "AUTO"))   fanMode = FanMode::AUTO;
+    else if (!strcasecmp(m, "MANUAL")) fanMode = FanMode::MANUAL;
+    else {
+      Serial.printf("[MQTT] ignore mode=%s (unsupported)\n", m);
+      return false;
+    }
     Serial.printf("[MQTT] mode=%s\n", m);
-    needPublishState = true;
-    stateRev++;
+    needPublishState = true; stateRev++;
     return true;
   };
 
-  if(t == TOPIC_CONTROL_MODE) {
-    parseMode();
+  // --- /control-mode
+  if (t == TP_MODE) { parseMode(); return; }
+
+  // --- /sensor-param  (semua field opsional)
+  if (t == TP_PARAMS) {
+    if (doc.containsKey("temp_on_c"))   cfg.temp_on_c  = doc["temp_on_c"].as<float>();
+    if (doc.containsKey("temp_off_c"))  cfg.temp_off_c = doc["temp_off_c"].as<float>();
+    if (doc.containsKey("rh_on_pct"))   cfg.rh_on_pct  = doc["rh_on_pct"].as<float>();
+    if (doc.containsKey("rh_off_pct"))  cfg.rh_off_pct = doc["rh_off_pct"].as<float>();
+    if (doc.containsKey("ema_alpha"))   cfg.ema_alpha  = doc["ema_alpha"].as<float>();
+
+    if (doc.containsKey("min_on_ms"))   cfg.min_on_ms  = doc["min_on_ms"].as<uint32_t>();
+    if (doc.containsKey("min_off_ms"))  cfg.min_off_ms = doc["min_off_ms"].as<uint32_t>();
+    if (doc.containsKey("anti_chatter"))cfg.anti_chatter = doc["anti_chatter"].as<bool>();
+
+    Serial.println("[MQTT] sensor-param updated");
+    // optional ack via state
+    needPublishState = true; stateRev++;
     return;
   }
-  
-  if(t == TOPIC_FAN) {
-    bool modeChanged = parseMode();
 
-    if(fanMode != FanMode::MANUAL) {
+  // --- /fan  (hanya dipakai saat MANUAL)
+  if (t == TP_FAN) {
+    parseMode(); // optional: boleh kirim sekalian "mode": "MANUAL"
+    if (fanMode != FanMode::MANUAL) {
       Serial.println("[MQTT] ignore fan[]: mode is not MANUAL");
       return;
     }
-
-    if(!doc.containsKey("fan") || !doc["fan"].is<JsonArray>()) {
+    if (!doc.containsKey("fan") || !doc["fan"].is<JsonArray>()) {
       Serial.println("[MQTT] fan[] is required");
       return;
     }
     JsonArray a = doc["fan"].as<JsonArray>();
-
-    if(a.size() != 6) {
+    if (a.size() != 6) {
       Serial.println("[MQTT] fan[] must be 6 elements");
       return;
     }
-
     uint8_t tmp[6];
-    for(size_t i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < 6; ++i) {
       int v = a[i].is<int>() ? a[i].as<int>() : 0;
-      tmp[i] = (v!=0) ? 1 : 0;
+      tmp[i] = (v != 0) ? 1 : 0;
     }
-
     applyFanArray(tmp);
     Serial.println("[MQTT] applied fan[] (MANUAL)");
     return;
   }
 
-  if(t == TOPIC_LAMP) {
+  // --- /lamp  (bool/int 0/1)
+  if (t == TP_LAMP) {
     int v = 1;
-
-    if(doc.containsKey("lamp")) {
-      if(doc["lamp"].is<bool>()) v = doc["lamp"].as<bool>() ? 1 : 0;
-      else if(doc["lamp"].is<int>()) v = doc["lamp"].as<int>() ? 1 : 0;
+    if (doc.containsKey("lamp")) {
+      if (doc["lamp"].is<bool>()) v = doc["lamp"].as<bool>() ? 1 : 0;
+      else if (doc["lamp"].is<int>()) v = doc["lamp"].as<int>() ? 1 : 0;
     }
-
-    if(v == 0) applyLamp(false);
-    else if(v == 1) applyLamp(true);
+    if (v == 0) applyLamp(false);
+    else if (v == 1) applyLamp(true);
     else Serial.println("[MQTT] lamp payload invalid");
     return;
   }
 }
+
+
 
 void ensureMqtt() {
   if(MqttClient.connected()) return;
@@ -340,7 +415,7 @@ void ensureMqtt() {
     clientId,
     mqtt_username,
     mqtt_password,
-    TOPIC_STATUS,
+    TP_STATUS,
     0,
     true,
     "offline"
@@ -352,13 +427,15 @@ void ensureMqtt() {
   }
   Serial.println("Connected");
 
-  MqttClient.publish(TOPIC_STATUS, "online", true);
+  MqttClient.publish(TP_STATUS, "online", true);
 
   // subscribe
-  MqttClient.publish(TOPIC_STATUS, "online", true);
-  MqttClient.subscribe(TOPIC_CONTROL_MODE, 1);
-  MqttClient.subscribe(TOPIC_FAN, 1);
-  MqttClient.subscribe(TOPIC_LAMP, 1);
+  MqttClient.publish(TP_STATUS, "online", true);
+  MqttClient.subscribe(TP_MODE, 1);
+  MqttClient.subscribe(TP_FAN, 1);
+  MqttClient.subscribe(TP_LAMP, 1);
+  MqttClient.subscribe(TP_PARAMS, 1);
+
 
   needPublishState = true;
 }
@@ -366,45 +443,42 @@ void ensureMqtt() {
 void controlLoop() {
   float t = !isnan(t_ds_c) ? t_ds_c : t_dht_c;
   float h = rh_dht;
-
   t_main = ema(t_main, t, cfg.ema_alpha);
 
-  if(fanMode == FanMode::AUTO) {
+  if (fanMode == FanMode::AUTO) {
     bool wantOn = false;
 
-    // combined hysteresis
-    if(!isnan(t_main) && (t_main >= cfg.temp_on_c)) wantOn = true;
-    
-    if(!isnan(h) && (h >= cfg.rh_on_pct)) wantOn = true;
+    // Hysteresis gabungan (suhu & RH)
+    if (!isnan(t_main) && (t_main >= cfg.temp_on_c))  wantOn = true;
+    if (!isnan(h)      && (h      >= cfg.rh_on_pct))  wantOn = true;
+    if (!isnan(t_main) && (t_main <= cfg.temp_off_c) &&
+        !isnan(h)      && (h      <= cfg.rh_off_pct)) wantOn = false;
 
-    if(!isnan(t_main) && (t_main <= cfg.temp_off_c) && !isnan(h) && (h <= cfg.rh_off_pct)) wantOn = false;
+    // Anti-chatter (minimum durasi ON/OFF)
+    if (cfg.anti_chatter) {
+      uint32_t dt = millis() - lastSwitchAt;
+      if (fans_group_on) {
+        // sedang ON: jangan OFF dulu jika belum lewat min_on_ms
+        if (dt < cfg.min_on_ms) wantOn = true;
+      } else {
+        // sedang OFF: jangan ON dulu jika belum lewat min_off_ms
+        if (dt < cfg.min_off_ms) wantOn = false;
+      }
+    }
 
-    bool currentlyOn = (fanArr[0] || fanArr[1] || fanArr[2] || fanArr[3] || fanArr[4] || fanArr[5]) ? true : false;
-
-    if(wantOn != currentlyOn) {
+    if (wantOn != fans_group_on) {
       applyFanGroup(wantOn);
-      Serial.printf("[FAN] mode = AUTO -> %s\n", wantOn ? "ON" : "OFF");
+      Serial.printf("[FAN] AUTO -> %s\n", wantOn ? "ON" : "OFF");
     }
   }
-  else if (fanMode == FanMode::FORCE_ON) {
-    // safety: paksa semua ON
-    bool allOn = (fanArr[0] & fanArr[1] & fanArr[2] & fanArr[3] & fanArr[4] & fanArr[5]) ? true  : false;
-    if (!allOn) applyFanGroup(true);
-  } else if (fanMode == FanMode::FORCE_OFF) {
-    bool anyOn = (fanArr[0] || fanArr[1] || fanArr[2] || fanArr[3] || fanArr[4] || fanArr[5]) ? true : false;
-    if (anyOn) applyFanGroup(false);
-  }
+  // MANUAL: tidak ada logika otomatis (fanArr ditentukan lewat MQTT)
 }
 
 // TELEMETRY PRINTING
-
-// ---------- Pretty printer helpers ----------
 const char* modeName(FanMode m) {
   switch (m) {
     case FanMode::AUTO: return "AUTO";
     case FanMode::MANUAL: return "MANUAL";
-    case FanMode::FORCE_ON: return "FORCE_ON";
-    case FanMode::FORCE_OFF: return "FORCE_OFF";
   }
   return "?";
 }
@@ -438,9 +512,7 @@ void printLineI(const char* label, int v) {
 String buildTelemetryJson() {
   char buf[MQTT_BUFFER];
   const unsigned long ts = millis()/1000;
-  const char* modeStr = (fanMode==FanMode::AUTO)?"AUTO":
-                        (fanMode==FanMode::MANUAL)?"MANUAL":
-                        (fanMode==FanMode::FORCE_ON)?"FORCE_ON":"FORCE_OFF";
+  const char* modeStr = (fanMode==FanMode::AUTO)?"AUTO" : "MANUAL";
 
   bool fix = gps.location.isValid();
   int  sat = gps.satellites.isValid() ? gps.satellites.value() : -1;
@@ -485,22 +557,19 @@ void publishStateNow() {
   buildFanArrayJson(fanJson);
   buildLampArrayJson(lampJson);
 
-  const char* modeStr = (fanMode == FanMode::AUTO) ? "AUTO" :
-    (fanMode == FanMode::MANUAL) ? "MANUAL" :
-    (fanMode == FanMode::FORCE_ON) ? "FORCE_ON" : "FORCE_OFF";
-
+  const char* modeStr = (fanMode == FanMode::AUTO) ? "AUTO" : "MANUAL";
   snprintf(buf, sizeof(buf),
     "{\"v\":1,\"rev\":%lu,\"mode\":\"%s\",\"fan\":%s,\"lamp\":%s}",
     stateRev, modeStr, fanJson, lampJson
   );
 
-  MqttClient.publish(TOPIC_STATE, buf, true);
+  MqttClient.publish(TP_STATE, buf, true);
   needPublishState = false;
 }
 
 void publishTelemetryNow() {
   String j = buildTelemetryJson();
-  MqttClient.publish(TOPIC_TELEMETRY, j.c_str()); // non-retained
+  MqttClient.publish(TP_TELEM, j.c_str()); // non-retained
 }
 
 
@@ -561,13 +630,39 @@ void handleSerial() {
     switch (c) {
       case 'm': printHelp(); break;
       case 'a': fanMode = FanMode::AUTO;     Serial.println(F("[FAN] mode=AUTO"));     break;
-      case 'n': fanMode = FanMode::FORCE_ON; Serial.println(F("[FAN] mode=FORCE_ON")); break;
-      case 'f': fanMode = FanMode::FORCE_OFF;Serial.println(F("[FAN] mode=FORCE_OFF"));break;
       case 'l': applyLamp(!lampState);       Serial.printf("[LAMP] %s\n", lampState?"ON":"OFF"); break;
       case 'p': printTelemetry(); break;
       default: break;
     }
   }
+}
+
+void updateLcd() {
+  // format nilai
+  char dsBuf[8], dhtBuf[8], rhBuf[8];
+  if (isnan(t_ds_c))  strcpy(dsBuf, "--.-"); else dtostrf(t_ds_c, 4, 1, dsBuf);
+  if (isnan(t_dht_c)) strcpy(dhtBuf, "--.-"); else dtostrf(t_dht_c, 4, 1, dhtBuf);
+  if (isnan(rh_dht))  strcpy(rhBuf, "--.-");  else dtostrf(rh_dht, 4, 1, rhBuf);
+
+  // baris 1: "DS:36.5C DHT:36.0C"
+  char line0[32];
+  snprintf(line0, sizeof(line0), "DS:%sC DHT:%sC", dsBuf, dhtBuf);
+
+  // baris 2: "RH:65.0% Fan:ON/OFF"
+  bool anyFanOn = (fanArr[0] || fanArr[1] || fanArr[2] || fanArr[3] || fanArr[4] || fanArr[5]);
+  char line1[32];
+  snprintf(line1, sizeof(line1), "RH:%s%% Fan:%s", rhBuf, anyFanOn ? "ON" : "OFF");
+
+  // baris 4: "MODE:AUTO LAMP:ON/OFF"
+  char line2[32];
+  snprintf(line2, sizeof(line2), "MODE:%s LAMP:%s", (
+    fanMode == FanMode::AUTO ? "AUTO" : "MANUAL",
+    lampState ? "ON" : "OFF"
+  ));
+
+  lcdPrintPadded(0, line0);
+  lcdPrintPadded(1, line1);
+  lcdPrintPadded(2, line2);
 }
 
 // ================== SETUP =================
@@ -579,13 +674,24 @@ void setup() {
   // WiFi
   espSecureClient.setCACert(root_ca);
   ensureWifi();
-  
+
+  // I2C untuk LCD (SDA=16, SCL=17)
+  Wire.begin(16, 17);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcdPrintPadded(0, "Booting...");
+  lcdPrintPadded(1, "Connecting WiFi");
 
   // Relay outputs -> OFF (failsafe)
   for (uint8_t pin : RELAY_PINS) {
     pinMode(pin, OUTPUT);
     relayOffPin(pin);
   }
+  // setelah inisialisasi relay OFF:
+  fans_group_on = false;
+  lastSwitchAt  = millis();
 
   // Sensors init
   dht.begin();
@@ -612,7 +718,12 @@ void setup() {
 
   // MQTT Setup
   MqttClient.setServer(mqtt_server, mqtt_port);
+  buildTopics();
   ensureMqtt();
+
+  // Update LCD
+  lcdPrintPadded(0, "WiFi OK  MQTT OK ");
+  lcdPrintPadded(1, "Starting...");
 }
 
 // ================== LOOP =================
@@ -624,12 +735,21 @@ void loop() {
     gps.encode(GPS_SER.read());
   }
 
+  // ---- Update LCD every 1s ----
+  if ((int32_t)(tNow - tNextLcd) >= 0) {
+    updateLcd();
+    tNextLcd = tNow + LCD_PERIOD_MS;
+  }
+
+
   // ---- DHT every 2s ----
   if ((int32_t)(tNow - tNextDHT) >= 0) {
     float h = dht.readHumidity();
     float t = dht.readTemperature(); // Celsius
+    
     if (!isnan(h)) rh_dht  = ema(rh_dht,  h, cfg.ema_alpha);
     if (!isnan(t)) t_dht_c = ema(t_dht_c, t, cfg.ema_alpha);
+    
     tNextDHT = tNow + DHT_PERIOD_MS;
   }
 
