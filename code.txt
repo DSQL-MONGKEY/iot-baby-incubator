@@ -54,6 +54,146 @@ void loop() {
 }
 
 
+========= Kode testing RELAY ==========
+
+
+#include <Arduino.h>
+
+static const bool RELAY_ACTIVE_LOW = true;
+
+// Sama persis seperti punyamu:
+const uint8_t RELAY_PINS[8] = { 18, 33, 32, 27, 26, 25, 2, 0 };
+
+// Lamp = CH6 & CH7  -> Relay 7 & 8
+const uint8_t LAMP_CH[] = { 6, 7 };
+
+// HELPERS
+inline int ON_LEVEL()  { return RELAY_ACTIVE_LOW ? LOW  : HIGH; }
+inline int OFF_LEVEL() { return RELAY_ACTIVE_LOW ? HIGH : LOW; }
+
+inline void relayOnPin(uint8_t pin)  { digitalWrite(pin, ON_LEVEL()); }
+inline void relayOffPin(uint8_t pin) { digitalWrite(pin, OFF_LEVEL()); }
+
+inline void relayOnCh(uint8_t ch)  { relayOnPin(RELAY_PINS[ch]); }
+inline void relayOffCh(uint8_t ch) { relayOffPin(RELAY_PINS[ch]); }
+
+void allRelaysOff() {
+  for (uint8_t pin : RELAY_PINS) relayOffPin(pin);
+}
+
+void lampBoth(bool on) {
+  if (on) {
+    relayOnCh(LAMP_CH[0]); // CH6 => GPIO2 (Relay 7)
+    relayOnCh(LAMP_CH[1]); // CH7 => GPIO0 (Relay 8)
+  } else {
+    relayOffCh(LAMP_CH[0]);
+    relayOffCh(LAMP_CH[1]);
+  }
+}
+
+void lamp7(bool on) { on ? relayOnCh(LAMP_CH[0]) : relayOffCh(LAMP_CH[0]); }
+void lamp8(bool on) { on ? relayOnCh(LAMP_CH[1]) : relayOffCh(LAMP_CH[1]); }
+
+// ================== MODE TEST ==================
+bool autoTest = true;
+uint32_t nextStepAt = 0;
+uint8_t stepIdx = 0;
+
+void runAutoTest() {
+  // sequence:
+  // 0: semua OFF
+  // 1: Relay7 ON
+  // 2: Relay7 OFF
+  // 3: Relay8 ON
+  // 4: Relay8 OFF
+  // 5: Both ON
+  // 6: Both OFF
+  // ulang
+  switch (stepIdx) {
+    case 0:
+      allRelaysOff();
+      Serial.println("[TEST] ALL OFF");
+      break;
+    case 1:
+      lamp7(true);
+      Serial.println("[TEST] RELAY 7 (CH6/GPIO2) ON");
+      break;
+    case 2:
+      lamp7(false);
+      Serial.println("[TEST] RELAY 7 OFF");
+      break;
+    case 3:
+      lamp8(true);
+      Serial.println("[TEST] RELAY 8 (CH7/GPIO0) ON");
+      break;
+    case 4:
+      lamp8(false);
+      Serial.println("[TEST] RELAY 8 OFF");
+      break;
+    case 5:
+      lampBoth(true);
+      Serial.println("[TEST] RELAY 7+8 ON");
+      break;
+    case 6:
+      lampBoth(false);
+      Serial.println("[TEST] RELAY 7+8 OFF");
+      break;
+  }
+
+  stepIdx = (stepIdx + 1) % 7;
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("=== Lamp Relay Test (Relay 7 & 8) ===");
+  Serial.println("7 : toggle Relay 7 (CH6/GPIO2)");
+  Serial.println("8 : toggle Relay 8 (CH7/GPIO0)");
+  Serial.println("b : toggle BOTH");
+  Serial.println("o : ALL OFF");
+  Serial.println("t : toggle AUTO TEST on/off");
+  Serial.println("=====================================");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\nBooting Lamp Relay Test...");
+
+  // Init relay pins secepat mungkin (failsafe OFF)
+  for (uint8_t pin : RELAY_PINS) {
+    pinMode(pin, OUTPUT);
+    relayOffPin(pin);
+  }
+  allRelaysOff();
+
+  printHelp();
+
+  nextStepAt = millis() + 1000;
+}
+
+void loop() {
+  // Serial commands
+  while (Serial.available()) {
+    char c = (char)tolower(Serial.read());
+
+    static bool r7 = false, r8 = false, rb = false;
+
+    if (c == '7') { r7 = !r7; lamp7(r7); Serial.printf("[CMD] Relay7 = %s\n", r7 ? "ON" : "OFF"); }
+    if (c == '8') { r8 = !r8; lamp8(r8); Serial.printf("[CMD] Relay8 = %s\n", r8 ? "ON" : "OFF"); }
+    if (c == 'b') { rb = !rb; lampBoth(rb); Serial.printf("[CMD] Both  = %s\n", rb ? "ON" : "OFF"); }
+    if (c == 'o') { r7 = r8 = rb = false; allRelaysOff(); Serial.println("[CMD] ALL OFF"); }
+    if (c == 't') { autoTest = !autoTest; Serial.printf("[CMD] autoTest = %s\n", autoTest ? "ON" : "OFF"); }
+    if (c == 'h') { printHelp(); }
+  }
+
+  // Auto test setiap 2 detik
+  if (autoTest && (int32_t)(millis() - nextStepAt) >= 0) {
+    runAutoTest();
+    nextStepAt = millis() + 2000;
+  }
+}
+
+
 
 ========== MAIN CODE ==========
 #include <Arduino.h>
@@ -69,7 +209,7 @@ void loop() {
 
 
 // WIFI
-const char* WIFI_SSID = "POCO X3 NFC";
+const char* WIFI_SSID = "LYMBADS";
 const char* WIFI_PASSWORD = "123456789";
 
 void ensureWifi() {
@@ -99,7 +239,7 @@ char clientId[40] = {0};
 const char* DEVICE_CODE = "001";
 
 // --- Buffer topic dinamis ---
-char TP_STATE[64], TP_TELEM[64], TP_FAN[64], TP_LAMP[64], TP_MODE[64], TP_PARAMS[64], TP_STATUS[64];
+char TP_STATE[64], TP_TELEM[64], TP_FAN[64], TP_LAMP[64], TP_MODE[64], TP_PARAMS[64], TP_STATUS[64], TP_ACK[64];
 
 void buildTopics() {
   snprintf(TP_STATE,  sizeof(TP_STATE),  "/psk/incubator/%s/state",        DEVICE_CODE);
@@ -108,7 +248,8 @@ void buildTopics() {
   snprintf(TP_LAMP,   sizeof(TP_LAMP),   "/psk/incubator/%s/lamp",         DEVICE_CODE);
   snprintf(TP_MODE,   sizeof(TP_MODE),   "/psk/incubator/%s/control-mode", DEVICE_CODE);
   snprintf(TP_PARAMS, sizeof(TP_PARAMS), "/psk/incubator/%s/sensor-param", DEVICE_CODE);
-  snprintf(TP_STATUS, sizeof(TP_STATUS), "/psk/incubator/%s/status",       DEVICE_CODE);
+  snprintf(TP_STATUS, sizeof(TP_STATUS), "/psk/incubator/%s/status",      DEVICE_CODE);
+  snprintf(TP_ACK, sizeof(TP_STATUS), "/psk/incubator/%s/ack",      DEVICE_CODE);
 }
 
 
@@ -171,7 +312,7 @@ const uint8_t LAMP_CH[] = { 6, 7 };
 #define DHT_TYPE DHT22
 
 // LCD - I2C
-#define LCD_I2C_ADDR 0x27 q
+#define LCD_I2C_ADDR 0x27
 
 // DS18B20
 #define ONEWIRE_PIN 4
@@ -192,7 +333,7 @@ uint32_t tNextLcd = 0;
 const uint32_t LCD_PERIOD_MS = 1000;
 
 // chaching flicker
-// cache untuk anti-flicker sampai 4 baris
+// cache untuk anti-flicker sampai 4 Row
 char lcdCache[4][21] = {0};
 
 void lcdPrintPadded(uint8_t row, const char* s) {
@@ -213,10 +354,10 @@ void lcdPrintPadded(uint8_t row, const char* s) {
 }
 
 struct Controlfg {
-  float    temp_on_c  = 36.0f;
-  float    temp_off_c = 35.5f;
-  float    rh_on_pct  = 65.0f;
-  float    rh_off_pct = 60.0f;
+  float    temp_on_c  = 30.0f;
+  float    temp_off_c = 29.5f;
+  float    rh_on_percent  = 60.0f;
+  float    rh_off_percent = 60.0f;
   float    ema_alpha  = 0.20f;
 
   // anti-chatter (opsional, default aktif)
@@ -269,7 +410,7 @@ float t_dht_c = NAN;
 float rh_dht = NAN;
 float t_main = NAN;
 
-// EMA BUFFER
+// EMA BUFFER (Exponential Moving Average)
 
 float ema(float prev, float val, float alpha) {
   if (isnan(val)) return prev;
@@ -365,6 +506,21 @@ void buildLampArrayJson(char out[8]) {
 }
 
 
+// MQTT PUBLISH HELPERS
+void publishAck(const char* type, const char* cid, bool ok, const char* msg = nullptr) {
+  char buf[256];
+  if (msg && *msg) {
+    snprintf(buf, sizeof(buf),
+      "{\"type\":\"%s\",\"correlationId\":%s\"%s\",\"ok\":%s,\"rev\":%lu,\"msg\":\"%s\"}",
+      type, cid ? "\"" : "", cid ? cid : "", ok ? "true" : "false", stateRev, msg);
+  } else {
+    snprintf(buf, sizeof(buf),
+      "{\"type\":\"%s\",\"correlationId\":%s\"%s\",\"ok\":%s,\"rev\":%lu}",
+      type, cid ? "\"" : "", cid ? cid : "", ok ? "true" : "false", stateRev);
+  }
+  MqttClient.publish(TP_ACK, buf, false);
+}
+
 // MQTT Callback
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String t = topic;
@@ -376,19 +532,34 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  const char* cid = nullptr;
+  if (doc.containsKey("correlationId") && doc["correlationId"].is<const char*>()) {
+    cid = doc["correlationId"].as<const char*>();
+  }
+
   auto parseMode = [&]() -> bool {
-    if (!doc.containsKey("mode")) return false;
-    const char* m = doc["mode"];
+    if(!doc.containsKey("mode") || !doc["mode"].is<const char*>()) {
+      publishAck("control-mode", cid, false, "mode is required");
+
+      Serial.println("[MQTT] mode is required");
+      return false;
+    }
+    
+    const char* m = doc["mode"].as<const char*>();
     if (!m) return false;
 
-    if (!strcasecmp(m, "AUTO"))   fanMode = FanMode::AUTO;
+    if (!strcasecmp(m, "AUTO")) fanMode = FanMode::AUTO;
     else if (!strcasecmp(m, "MANUAL")) fanMode = FanMode::MANUAL;
     else {
+      publishAck("control-mode", cid, false, "unsupported mode");
       Serial.printf("[MQTT] ignore mode=%s (unsupported)\n", m);
       return false;
     }
+
     Serial.printf("[MQTT] mode=%s\n", m);
     needPublishState = true; stateRev++;
+    
+    publishAck("control-mode", cid, true, nullptr);
     return true;
   };
 
@@ -397,33 +568,45 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // --- /sensor-param  (semua field opsional)
   if (t == TP_PARAMS) {
-    if (doc.containsKey("temp_on_c"))   cfg.temp_on_c  = doc["temp_on_c"].as<float>();
-    if (doc.containsKey("temp_off_c"))  cfg.temp_off_c = doc["temp_off_c"].as<float>();
-    if (doc.containsKey("rh_on_pct"))   cfg.rh_on_pct  = doc["rh_on_pct"].as<float>();
-    if (doc.containsKey("rh_off_pct"))  cfg.rh_off_pct = doc["rh_off_pct"].as<float>();
-    if (doc.containsKey("ema_alpha"))   cfg.ema_alpha  = doc["ema_alpha"].as<float>();
+    if (doc.containsKey("temp_on_c")) cfg.temp_on_c  = doc["temp_on_c"].as<float>();
+    
+    if (doc.containsKey("temp_off_c")) cfg.temp_off_c = doc["temp_off_c"].as<float>();
+    
+    if (doc.containsKey("rh_on_percent")) cfg.rh_on_percent  = doc["rh_on_percent"].as<float>();
+    
+    if (doc.containsKey("rh_off_percent")) cfg.rh_off_percent = doc["rh_off_percent"].as<float>();
+    
+    if (doc.containsKey("ema_alpha")) cfg.ema_alpha  = doc["ema_alpha"].as<float>();
 
-    if (doc.containsKey("min_on_ms"))   cfg.min_on_ms  = doc["min_on_ms"].as<uint32_t>();
-    if (doc.containsKey("min_off_ms"))  cfg.min_off_ms = doc["min_off_ms"].as<uint32_t>();
-    if (doc.containsKey("anti_chatter"))cfg.anti_chatter = doc["anti_chatter"].as<bool>();
+    if (doc.containsKey("min_on_ms")) cfg.min_on_ms  = doc["min_on_ms"].as<uint32_t>();
+    
+    if (doc.containsKey("min_off_ms")) cfg.min_off_ms = doc["min_off_ms"].as<uint32_t>();
+    
+    if (doc.containsKey("anti_chatter")) cfg.anti_chatter = doc["anti_chatter"].as<bool>();
 
     Serial.println("[MQTT] sensor-param updated");
     // optional ack via state
-    needPublishState = true; stateRev++;
+    needPublishState = true; 
+    stateRev++;
+
+    publishAck("sensor-param", cid, true, nullptr);
     return;
   }
 
   // --- /fan  (hanya dipakai saat MANUAL)
   if (t == TP_FAN) {
-    parseMode(); // optional: boleh kirim sekalian "mode": "MANUAL"
+    parseMode(); 
+    
     if (fanMode != FanMode::MANUAL) {
       Serial.println("[MQTT] ignore fan[]: mode is not MANUAL");
       return;
     }
+
     if (!doc.containsKey("fan") || !doc["fan"].is<JsonArray>()) {
       Serial.println("[MQTT] fan[] is required");
       return;
     }
+
     JsonArray a = doc["fan"].as<JsonArray>();
     if (a.size() != 6) {
       Serial.println("[MQTT] fan[] must be 6 elements");
@@ -434,26 +617,32 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       int v = a[i].is<int>() ? a[i].as<int>() : 0;
       tmp[i] = (v != 0) ? 1 : 0;
     }
+    
     applyFanArray(tmp);
     Serial.println("[MQTT] applied fan[] (MANUAL)");
+
+    publishAck("fan", cid, true, nullptr);
     return;
   }
 
   // --- /lamp  (bool/int 0/1)
   if (t == TP_LAMP) {
     int v = 1;
+    
     if (doc.containsKey("lamp")) {
       if (doc["lamp"].is<bool>()) v = doc["lamp"].as<bool>() ? 1 : 0;
       else if (doc["lamp"].is<int>()) v = doc["lamp"].as<int>() ? 1 : 0;
+      else { publishAck("lamp", cid, false, "lamp must be 2 elements of 0/1"); return; }
     }
+    
     if (v == 0) applyLamp(false);
     else if (v == 1) applyLamp(true);
     else Serial.println("[MQTT] lamp payload invalid");
+    
+    publishAck("lamp", cid, true, nullptr);
     return;
   }
 }
-
-
 
 void ensureMqtt() {
   if(MqttClient.connected()) return;
@@ -508,9 +697,9 @@ void controlLoop() {
 
     // Hysteresis gabungan (suhu & RH)
     if (!isnan(t_main) && (t_main >= cfg.temp_on_c))  wantOn = true;
-    if (!isnan(h)      && (h      >= cfg.rh_on_pct))  wantOn = true;
+    if (!isnan(h)      && (h      >= cfg.rh_on_percent))  wantOn = true;
     if (!isnan(t_main) && (t_main <= cfg.temp_off_c) &&
-        !isnan(h)      && (h      <= cfg.rh_off_pct)) wantOn = false;
+        !isnan(h)      && (h      <= cfg.rh_off_percent)) wantOn = false;
 
     // Anti-chatter (minimum durasi ON/OFF)
     if (cfg.anti_chatter) {
@@ -527,6 +716,7 @@ void controlLoop() {
     if (wantOn != fans_group_on) {
       applyFanGroup(wantOn);
       Serial.printf("[FAN] AUTO -> %s\n", wantOn ? "ON" : "OFF");
+      applyLamp(wantOn);
     }
   }
   // MANUAL: tidak ada logika otomatis (fanArr ditentukan lewat MQTT)
@@ -675,8 +865,6 @@ void printHelp() {
     "\n== Inkubator MVP Control ==\n"
     "m : show menu\n"
     "a : FAN mode AUTO\n"
-    "n : FAN FORCE ON\n"
-    "f : FAN FORCE OFF\n"
     "l : toggle LAMP group (CH7+CH8)\n"
     "p : print current telemetry once\n"
   ));
@@ -696,23 +884,32 @@ void handleSerial() {
 }
 
 void updateLcd() {
-  // format nilai
+  
+  // format value
   char dsBuf[8], dhtBuf[8], rhBuf[8];
   if (isnan(t_ds_c))  strcpy(dsBuf, "--.-"); else dtostrf(t_ds_c, 4, 1, dsBuf);
   if (isnan(t_dht_c)) strcpy(dhtBuf, "--.-"); else dtostrf(t_dht_c, 4, 1, dhtBuf);
   if (isnan(rh_dht))  strcpy(rhBuf, "--.-");  else dtostrf(rh_dht, 4, 1, rhBuf);
 
-  // baris 1: "DS:36.5C DHT:36.0C"
+  // Row 1: "DS:36.5C DHT:36.0C"
   char line0[32];
   snprintf(line0, sizeof(line0), "DS:%sC DHT:%sC", dsBuf, dhtBuf);
 
-  // baris 2: "RH:65.0% Fan:ON/OFF"
+  // Row 2: "RH:65.0% Fan:ON/OFF"
   bool anyFanOn = (fanArr[0] || fanArr[1] || fanArr[2] || fanArr[3] || fanArr[4] || fanArr[5]);
   char line1[32];
   snprintf(line1, sizeof(line1), "RH:%s%% Fan:%s", rhBuf, anyFanOn ? "ON" : "OFF");
 
+  // Row 4: "MODE:AUTO LAMP:ON/OFF"
+  char line2[32];
+  const char* modeStr = (fanMode == FanMode::AUTO) ? "AUTO" : "MANUAL";
+  const char* lampStr = lampState ? "ON" : "OFF";
+
+  snprintf(line2, sizeof(line2), "MODE:%s LAMP:%s", modeStr, lampStr);
+
   lcdPrintPadded(0, line0);
   lcdPrintPadded(1, line1);
+  lcdPrintPadded(2, line2);
 }
 
 // ================== SETUP =================
@@ -796,8 +993,10 @@ void loop() {
   if ((int32_t)(tNow - tNextDHT) >= 0) {
     float h = dht.readHumidity();
     float t = dht.readTemperature(); // Celsius
+    
     if (!isnan(h)) rh_dht  = ema(rh_dht,  h, cfg.ema_alpha);
     if (!isnan(t)) t_dht_c = ema(t_dht_c, t, cfg.ema_alpha);
+    
     tNextDHT = tNow + DHT_PERIOD_MS;
   }
 

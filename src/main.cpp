@@ -11,7 +11,7 @@
 
 
 // WIFI
-const char* WIFI_SSID = "POCO X3 NFC";
+const char* WIFI_SSID = "LYMBADS";
 const char* WIFI_PASSWORD = "123456789";
 
 void ensureWifi() {
@@ -41,7 +41,7 @@ char clientId[40] = {0};
 const char* DEVICE_CODE = "001";
 
 // --- Buffer topic dinamis ---
-char TP_STATE[64], TP_TELEM[64], TP_FAN[64], TP_LAMP[64], TP_MODE[64], TP_PARAMS[64], TP_STATUS[64];
+char TP_STATE[64], TP_TELEM[64], TP_FAN[64], TP_LAMP[64], TP_MODE[64], TP_PARAMS[64], TP_STATUS[64], TP_ACK[64];
 
 void buildTopics() {
   snprintf(TP_STATE,  sizeof(TP_STATE),  "/psk/incubator/%s/state",        DEVICE_CODE);
@@ -50,7 +50,8 @@ void buildTopics() {
   snprintf(TP_LAMP,   sizeof(TP_LAMP),   "/psk/incubator/%s/lamp",         DEVICE_CODE);
   snprintf(TP_MODE,   sizeof(TP_MODE),   "/psk/incubator/%s/control-mode", DEVICE_CODE);
   snprintf(TP_PARAMS, sizeof(TP_PARAMS), "/psk/incubator/%s/sensor-param", DEVICE_CODE);
-  snprintf(TP_STATUS, sizeof(TP_STATUS), "/psk/incubator/%s/status",       DEVICE_CODE);
+  snprintf(TP_STATUS, sizeof(TP_STATUS), "/psk/incubator/%s/status",      DEVICE_CODE);
+  snprintf(TP_ACK, sizeof(TP_STATUS), "/psk/incubator/%s/ack",      DEVICE_CODE);
 }
 
 
@@ -134,7 +135,7 @@ uint32_t tNextLcd = 0;
 const uint32_t LCD_PERIOD_MS = 1000;
 
 // chaching flicker
-// cache untuk anti-flicker sampai 4 baris
+// cache untuk anti-flicker sampai 4 Row
 char lcdCache[4][21] = {0};
 
 void lcdPrintPadded(uint8_t row, const char* s) {
@@ -157,8 +158,8 @@ void lcdPrintPadded(uint8_t row, const char* s) {
 struct Controlfg {
   float    temp_on_c  = 30.0f;
   float    temp_off_c = 29.5f;
-  float    rh_on_pct  = 60.0f;
-  float    rh_off_pct = 60.0f;
+  float    rh_on_percent  = 60.0f;
+  float    rh_off_percent = 60.0f;
   float    ema_alpha  = 0.20f;
 
   // anti-chatter (opsional, default aktif)
@@ -306,6 +307,70 @@ void buildLampArrayJson(char out[8]) {
   snprintf(out, 8, "[%u,%u]", v, v);
 }
 
+// SYNC FAN & LAMP
+void syncAutoOutputs(bool wantFanOn) {
+  bool changed = false;
+
+  // 1) FAN group
+  if (wantFanOn != fans_group_on) {
+    for (size_t i = 0; i < (sizeof(FAN_CH) / sizeof(FAN_CH[0])); ++i) {
+      uint8_t pin = RELAY_PINS[FAN_CH[i]];
+      if (wantFanOn) relayOnPin(pin); else relayOffPin(pin);
+      fanArr[i] = wantFanOn ? 1 : 0;
+    }
+    fans_group_on = wantFanOn;
+    lastSwitchAt  = millis();
+    changed = true;
+
+    Serial.printf("[FAN] AUTO -> %s\n", wantFanOn ? "ON" : "OFF");
+  }
+
+  // 2) LAMP (inverse dari FAN di AUTO)
+  const bool wantLampOn = !wantFanOn;
+  if (wantLampOn != lampState) {
+    setGroup(LAMP_CH, sizeof(LAMP_CH), wantLampOn);
+    lampState = wantLampOn;
+    changed = true;
+
+    Serial.printf("[LAMP] AUTO -> %s\n", wantLampOn ? "ON" : "OFF");
+  }
+
+  // 3) bump rev sekali
+  if (changed) {
+    needPublishState = true;
+    stateRev++;
+  }
+}
+
+
+// MQTT PUBLISH HELPERS
+void publishAck(const char* type, const char* cid, bool ok, const char* msg = nullptr) {
+  char buf[256];
+
+  // fallback biar valid JSON
+  if (!cid) cid = "";
+
+  if (msg && *msg) {
+    snprintf(buf, sizeof(buf),
+      "{\"type\":\"%s\",\"correlationId\":\"%s\",\"ok\":%s,\"rev\":%lu,\"msg\":\"%s\"}",
+      type,
+      cid,
+      ok ? "true" : "false",
+      (unsigned long)stateRev,
+      msg
+    );
+  } else {
+    snprintf(buf, sizeof(buf),
+      "{\"type\":\"%s\",\"correlationId\":\"%s\",\"ok\":%s,\"rev\":%lu}",
+      type,
+      cid,
+      ok ? "true" : "false",
+      (unsigned long)stateRev
+    );
+  }
+
+  MqttClient.publish(TP_ACK, buf, false);
+}
 
 // MQTT Callback
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -318,19 +383,34 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  const char* cid = nullptr;
+  if (doc.containsKey("correlationId") && doc["correlationId"].is<const char*>()) {
+    cid = doc["correlationId"].as<const char*>();
+  }
+
   auto parseMode = [&]() -> bool {
-    if (!doc.containsKey("mode")) return false;
-    const char* m = doc["mode"];
+    if(!doc.containsKey("mode") || !doc["mode"].is<const char*>()) {
+      publishAck("control-mode", cid, false, "mode is required");
+
+      Serial.println("[MQTT] mode is required");
+      return false;
+    }
+    
+    const char* m = doc["mode"].as<const char*>();
     if (!m) return false;
 
-    if (!strcasecmp(m, "AUTO"))   fanMode = FanMode::AUTO;
+    if (!strcasecmp(m, "AUTO")) fanMode = FanMode::AUTO;
     else if (!strcasecmp(m, "MANUAL")) fanMode = FanMode::MANUAL;
     else {
+      publishAck("control-mode", cid, false, "unsupported mode");
       Serial.printf("[MQTT] ignore mode=%s (unsupported)\n", m);
       return false;
     }
+
     Serial.printf("[MQTT] mode=%s\n", m);
     needPublishState = true; stateRev++;
+    
+    publishAck("control-mode", cid, true, nullptr);
     return true;
   };
 
@@ -339,33 +419,45 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // --- /sensor-param  (semua field opsional)
   if (t == TP_PARAMS) {
-    if (doc.containsKey("temp_on_c"))   cfg.temp_on_c  = doc["temp_on_c"].as<float>();
-    if (doc.containsKey("temp_off_c"))  cfg.temp_off_c = doc["temp_off_c"].as<float>();
-    if (doc.containsKey("rh_on_pct"))   cfg.rh_on_pct  = doc["rh_on_pct"].as<float>();
-    if (doc.containsKey("rh_off_pct"))  cfg.rh_off_pct = doc["rh_off_pct"].as<float>();
-    if (doc.containsKey("ema_alpha"))   cfg.ema_alpha  = doc["ema_alpha"].as<float>();
+    if (doc.containsKey("temp_on_c")) cfg.temp_on_c  = doc["temp_on_c"].as<float>();
+    
+    if (doc.containsKey("temp_off_c")) cfg.temp_off_c = doc["temp_off_c"].as<float>();
+    
+    if (doc.containsKey("rh_on_percent")) cfg.rh_on_percent  = doc["rh_on_percent"].as<float>();
+    
+    if (doc.containsKey("rh_off_percent")) cfg.rh_off_percent = doc["rh_off_percent"].as<float>();
+    
+    if (doc.containsKey("ema_alpha")) cfg.ema_alpha  = doc["ema_alpha"].as<float>();
 
-    if (doc.containsKey("min_on_ms"))   cfg.min_on_ms  = doc["min_on_ms"].as<uint32_t>();
-    if (doc.containsKey("min_off_ms"))  cfg.min_off_ms = doc["min_off_ms"].as<uint32_t>();
-    if (doc.containsKey("anti_chatter"))cfg.anti_chatter = doc["anti_chatter"].as<bool>();
+    if (doc.containsKey("min_on_ms")) cfg.min_on_ms  = doc["min_on_ms"].as<uint32_t>();
+    
+    if (doc.containsKey("min_off_ms")) cfg.min_off_ms = doc["min_off_ms"].as<uint32_t>();
+    
+    if (doc.containsKey("anti_chatter")) cfg.anti_chatter = doc["anti_chatter"].as<bool>();
 
     Serial.println("[MQTT] sensor-param updated");
     // optional ack via state
-    needPublishState = true; stateRev++;
+    needPublishState = true; 
+    stateRev++;
+
+    publishAck("sensor-param", cid, true, nullptr);
     return;
   }
 
   // --- /fan  (hanya dipakai saat MANUAL)
   if (t == TP_FAN) {
-    parseMode(); // optional: boleh kirim sekalian "mode": "MANUAL"
+    parseMode(); 
+    
     if (fanMode != FanMode::MANUAL) {
       Serial.println("[MQTT] ignore fan[]: mode is not MANUAL");
       return;
     }
+
     if (!doc.containsKey("fan") || !doc["fan"].is<JsonArray>()) {
       Serial.println("[MQTT] fan[] is required");
       return;
     }
+
     JsonArray a = doc["fan"].as<JsonArray>();
     if (a.size() != 6) {
       Serial.println("[MQTT] fan[] must be 6 elements");
@@ -376,26 +468,68 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       int v = a[i].is<int>() ? a[i].as<int>() : 0;
       tmp[i] = (v != 0) ? 1 : 0;
     }
+    
     applyFanArray(tmp);
     Serial.println("[MQTT] applied fan[] (MANUAL)");
+
+    publishAck("fan", cid, true, nullptr);
     return;
   }
 
   // --- /lamp  (bool/int 0/1)
+  auto parse01 = [](JsonVariant v, int &out) -> bool {
+    if (v.is<bool>()) { out = v.as<bool>() ? 1 : 0; return true; }
+    if (v.is<int>())  { out = v.as<int>() ? 1 : 0; return true; }
+    return false;
+  };
+
   if (t == TP_LAMP) {
-    int v = 1;
-    if (doc.containsKey("lamp")) {
-      if (doc["lamp"].is<bool>()) v = doc["lamp"].as<bool>() ? 1 : 0;
-      else if (doc["lamp"].is<int>()) v = doc["lamp"].as<int>() ? 1 : 0;
+    if (fanMode == FanMode::AUTO) {
+      publishAck("lamp", cid, false, "lamp is auto-controlled in AUTO mode");
+      Serial.println("[MQTT] ignore lamp: AUTO mode controls lamp");
+      return;
     }
-    if (v == 0) applyLamp(false);
-    else if (v == 1) applyLamp(true);
-    else Serial.println("[MQTT] lamp payload invalid");
+
+    if (!doc.containsKey("lamp")) {
+      publishAck("lamp", cid, false, "lamp is required");
+      return;
+    }
+
+    JsonVariant lv = doc["lamp"];
+
+    int a0 = 0, a1 = 0;
+
+    if (lv.is<JsonArray>()) {
+      JsonArray arr = lv.as<JsonArray>();
+      if (arr.size() != 2) {
+        publishAck("lamp", cid, false, "lamp must be 2 elements [0/1,0/1]");
+        return;
+      }
+      if (!parse01(arr[0], a0) || !parse01(arr[1], a1)) {
+        publishAck("lamp", cid, false, "lamp elements must be 0/1 or bool");
+        return;
+      }
+
+      // Karena hardware kamu pakai applyLamp(group), pastikan nilainya konsisten
+      if (a0 != a1) {
+        publishAck("lamp", cid, false, "lamp array must be [0,0] or [1,1] (group control)");
+        return;
+      }
+    } else {
+      int v = 0;
+      if (!parse01(lv, v)) {
+        publishAck("lamp", cid, false, "lamp must be bool, int 0/1, or array [0/1,0/1]");
+        return;
+      }
+      a0 = a1 = v;
+    }
+
+    applyLamp(a0 == 1);
+    publishAck("lamp", cid, true, nullptr);
     return;
   }
+
 }
-
-
 
 void ensureMqtt() {
   if(MqttClient.connected()) return;
@@ -450,9 +584,9 @@ void controlLoop() {
 
     // Hysteresis gabungan (suhu & RH)
     if (!isnan(t_main) && (t_main >= cfg.temp_on_c))  wantOn = true;
-    if (!isnan(h)      && (h      >= cfg.rh_on_pct))  wantOn = true;
+    if (!isnan(h)      && (h      >= cfg.rh_on_percent))  wantOn = true;
     if (!isnan(t_main) && (t_main <= cfg.temp_off_c) &&
-        !isnan(h)      && (h      <= cfg.rh_off_pct)) wantOn = false;
+        !isnan(h)      && (h      <= cfg.rh_off_percent)) wantOn = false;
 
     // Anti-chatter (minimum durasi ON/OFF)
     if (cfg.anti_chatter) {
@@ -466,10 +600,7 @@ void controlLoop() {
       }
     }
 
-    if (wantOn != fans_group_on) {
-      applyFanGroup(wantOn);
-      Serial.printf("[FAN] AUTO -> %s\n", wantOn ? "ON" : "OFF");
-    }
+    syncAutoOutputs(wantOn);
   }
   // MANUAL: tidak ada logika otomatis (fanArr ditentukan lewat MQTT)
 }
@@ -617,8 +748,6 @@ void printHelp() {
     "\n== Inkubator MVP Control ==\n"
     "m : show menu\n"
     "a : FAN mode AUTO\n"
-    "n : FAN FORCE ON\n"
-    "f : FAN FORCE OFF\n"
     "l : toggle LAMP group (CH7+CH8)\n"
     "p : print current telemetry once\n"
   ));
@@ -628,37 +757,52 @@ void handleSerial() {
   while (Serial.available()) {
     int c = tolower(Serial.read());
     switch (c) {
-      case 'm': printHelp(); break;
-      case 'a': fanMode = FanMode::AUTO;     Serial.println(F("[FAN] mode=AUTO"));     break;
-      case 'l': applyLamp(!lampState);       Serial.printf("[LAMP] %s\n", lampState?"ON":"OFF"); break;
-      case 'p': printTelemetry(); break;
+      case 'm': 
+        printHelp(); 
+      break;
+      case 'a': 
+        fanMode = FanMode::AUTO;
+        Serial.println(F("[FAN] mode=AUTO"));
+      break;
+      case 'l':
+        if (fanMode == FanMode::AUTO) {
+          Serial.println("[LAMP] ignored (AUTO mode controls lamp)");
+        } else {
+          applyLamp(!lampState);
+          Serial.printf("[LAMP] %s\n", lampState ? "ON" : "OFF");
+        }
+      break;
+      case 'p': 
+        printTelemetry();
+        break;
       default: break;
     }
   }
 }
 
 void updateLcd() {
-  // format nilai
+  
+  // format value
   char dsBuf[8], dhtBuf[8], rhBuf[8];
   if (isnan(t_ds_c))  strcpy(dsBuf, "--.-"); else dtostrf(t_ds_c, 4, 1, dsBuf);
   if (isnan(t_dht_c)) strcpy(dhtBuf, "--.-"); else dtostrf(t_dht_c, 4, 1, dhtBuf);
   if (isnan(rh_dht))  strcpy(rhBuf, "--.-");  else dtostrf(rh_dht, 4, 1, rhBuf);
 
-  // baris 1: "DS:36.5C DHT:36.0C"
+  // Row 1: "DS:36.5C DHT:36.0C"
   char line0[32];
   snprintf(line0, sizeof(line0), "DS:%sC DHT:%sC", dsBuf, dhtBuf);
 
-  // baris 2: "RH:65.0% Fan:ON/OFF"
+  // Row 2: "RH:65.0% Fan:ON/OFF"
   bool anyFanOn = (fanArr[0] || fanArr[1] || fanArr[2] || fanArr[3] || fanArr[4] || fanArr[5]);
   char line1[32];
   snprintf(line1, sizeof(line1), "RH:%s%% Fan:%s", rhBuf, anyFanOn ? "ON" : "OFF");
 
-  // baris 4: "MODE:AUTO LAMP:ON/OFF"
+  // Row 4: "MODE:AUTO LAMP:ON/OFF"
   char line2[32];
-  snprintf(line2, sizeof(line2), "MODE:%s LAMP:%s", (
-    fanMode == FanMode::AUTO ? "AUTO" : "MANUAL",
-    lampState ? "ON" : "OFF"
-  ));
+  const char* modeStr = (fanMode == FanMode::AUTO) ? "AUTO" : "MANUAL";
+  const char* lampStr = lampState ? "ON" : "OFF";
+
+  snprintf(line2, sizeof(line2), "MODE:%s LAMP:%s", modeStr, lampStr);
 
   lcdPrintPadded(0, line0);
   lcdPrintPadded(1, line1);
